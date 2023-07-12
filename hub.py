@@ -1,7 +1,9 @@
 from urllib.request import urlopen, Request
 import base64
 import sys
+import array
 from typing import Generator
+
 
 
 HOST = 'localhost'
@@ -33,6 +35,35 @@ def uleb128_decode(values: bytes) -> Generator:
             shift = 0
         else:
             shift += 7
+
+
+class ComputerCRC8:
+    def __init__(self, generator: int):
+        self.generator = generator
+        self.crctable = self.calc_table(generator)
+
+    def compute(self, input_bytes: bytes):
+        crc = 0
+        for byte in input_bytes:
+            # print(crc, byte ^ crc)
+            crc = self.crctable[byte ^ crc]
+        return crc
+
+    @staticmethod
+    def calc_table(generator: int) -> list:
+        crctable = [0] * 256
+        for dividend in range(256):
+            current_byte = dividend
+            for bit in range(8):
+                if current_byte & 0x80 != 0:
+                    current_byte <<= 1
+                    current_byte &= 255
+                    current_byte ^= generator
+                else:
+                    current_byte <<= 1
+                    current_byte &= 255
+            crctable[dividend] = current_byte
+        return crctable
 
 
 class Payload:
@@ -79,9 +110,10 @@ class Payload:
 
 
 class Packet:
-    def __init__(self, length: int, payload: Payload, crc8: int):
+    def __init__(self, length: int, payload: Payload, crc8: int | None = None):
         self.length = length
         self.payload = payload
+        self.crc8_computer = ComputerCRC8(0x1D)
         self.crc8 = crc8
 
     @classmethod
@@ -91,15 +123,17 @@ class Packet:
         payload = Payload.from_bytes(b64decoded_string[1:-1])
         return cls(length, payload, crc8)
 
-    def encode(self):
-        return (self.length.to_bytes(1, 'big')
-                + self.payload.encode()
-                + self.crc8.to_bytes(1, 'big'))
+    def encode(self) -> bytearray:
+        payload_bytes = self.payload.encode()
+        crc8 = self.crc8_computer.compute(payload_bytes)
+        return bytearray(self.length.to_bytes(1, 'big')
+                         + self.payload.encode()
+                         + crc8.to_bytes(1, 'big'))
 
     def __repr__(self):
         return f'{self.__class__.__name__}({self.length}, {self.payload}, {self.crc8})'
 
-    def __eq__(self, other):
+    def __eq__(self, other):                                                                            
         # Добавил это, чтобы упростить код в тестах
         return (self.length == other.length
                 and self.payload == other.payload
@@ -110,8 +144,8 @@ def send_request(url: str, data):
     req = Request(url, data, method='POST')
     with urlopen(req) as resp:
         return resp
-    
-    
+
+
 def main(url: str, myaddr: int):
     pass
 
