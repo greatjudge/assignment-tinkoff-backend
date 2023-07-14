@@ -317,7 +317,6 @@ class Switch(AbsStatused):
 
     @classmethod
     def from_bytes(cls, cmd_body: bytes, address: int):
-        # b64decoded_string - encoded cmd_body in whoishere, iamhere
         name, name_len = decode_string(cmd_body)
         devices = decode_array_of_str(cmd_body[name_len:])
         print(devices)
@@ -392,7 +391,6 @@ class EnvSensor(AbsStatused):
         self.reqstatus_times: Deque[int] = deque()
 
 
-
 class DeviceBuilder:
     devtype2device = {
         DeviceType.Lamp: Lamp,
@@ -415,36 +413,37 @@ class SmartHub:
         self.encoded_name = encode_string(self.name)
         self.url = url
         self.src = src
-        self.serial = serial
         self.dev_type = DeviceType.SmartHub
         self.packets_to_send: Deque[Packet] = deque()
+        self._serial = serial
 
-        self.device_builder = DeviceBuilder()
-        self.devices = {}
+        self._device_builder = DeviceBuilder()
+        self._devices = {dev_type: {} for dev_type in DeviceType}
         self.name2device = {}
 
-        self.whoishere_time = None
+        self.timer = Timer()
+        self._whoishere_time = None
 
     def _form_whoishere(self) -> Packet:
         return Packet(Payload(self.src, 0x3FFF,
-                              self.serial, self.dev_type,
+                              self._serial, self.dev_type,
                               Command.WHOISHERE, self.encoded_name))
 
     def _form_iamhere(self) -> Packet:
         return Packet(Payload(self.src, 0x3FFF,
-                              self.serial, self.dev_type,
+                              self._serial, self.dev_type,
                               Command.IAMHERE, self.encoded_name))
 
     def _add_device(self, device):
-        self.devices[device.dev_type][device.address] = device
+        self._devices[device.dev_type][device.address] = device
         self.name2device[device.name] = device
 
     def remove_device(self, device):
-        self.devices[device.dev_type].pop(device.address, None)
+        self._devices[device.dev_type].pop(device.address, None)
         self.name2device.pop(device.name, None)
 
     def _handle_iamhere(self, packet: Packet):
-        device = self.device_builder.build_device_from_bytes(
+        device = self._device_builder.build_device_from_bytes(
             packet.payload.cmd_body,
             packet.payload.dev_type,
             packet.payload.src
@@ -459,18 +458,11 @@ class SmartHub:
 
     def _handle_status(self, packet: Packet):
         address = packet.payload.src
-        device = self.devices[packet.payload.dev_type].get(address)
+        device = self._devices[packet.payload.dev_type].get(address)
         if device is not None:
             device.handle_status(self, packet.payload.cmd_body)
 
     def start(self):
-
-        self.timer = Timer()
-        time_whoishere = None
-
-        self.devices = {dev_type: {} for dev_type in DeviceType}
-        self.name2device = {}
-        self.packets_to_send: Deque[Packet] = deque()
         self.packets_to_send.appendleft(self._form_whoishere())
 
         while True:
@@ -484,7 +476,7 @@ class SmartHub:
 
             try:
                 res = send_request(self.url, b64_encode(p))
-                self.serial += 1
+                self._serial += 1
             except RequestException:
                 sys.exit(99)
 
@@ -507,9 +499,9 @@ class SmartHub:
                 for packet in packets:
                     match packet.payload.cmd:
                         case Command.IAMHERE:
-                            if time_whoishere is None:
-                                time_whoishere = self.timer.time
-                            if self.timer.time - time_whoishere < 300:
+                            if self._whoishere_time is None:
+                                self._whoishere_time = self.timer.time
+                            if self.timer.time - self._whoishere_time < 300:
                                 self._handle_iamhere(packet)
                         case Command.WHOISHERE:
                             self._handle_whoishere(packet)
@@ -520,7 +512,7 @@ class SmartHub:
                 sys.exit(0)
             else:
                 sys.exit(99)
-            print(self.devices)
+            print(self._devices)
             print(self.name2device)
             print()
             print()
