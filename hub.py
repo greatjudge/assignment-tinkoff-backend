@@ -600,8 +600,4 @@ if __name__ == '__main__':
     if len(sys.argv) > 1:
         url = sys.argv[1]
         myaddr = int(sys.argv[2], 16)
-        print(url, myaddr)
-        print()
         main(url, myaddr)
-    data = base64.urlsafe_b64encode(b'').rstrip(b'=')
-    s = base64.urlsafe_b64decode('DbMG_38BBgaI0Kv6kzGK')
