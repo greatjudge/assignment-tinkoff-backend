@@ -9,10 +9,10 @@ from typing import Deque
 from abc import ABC, abstractmethod
 
 import requests
-from requests import RequestException
+from requests import RequestException, Response
 
 
-class CRC8Exception(Exception):
+class CRC8Error(Exception):
     pass
 
 
@@ -44,6 +44,7 @@ def uleb128_encode(value: int) -> bytearray:
 
 
 def uleb128_decode(b64decoded_string: bytes) -> Generator:
+    # yield byte, byte number (from 1)
     result = 0
     shift = 0
     for i, byte in enumerate(b64decoded_string, 1):
@@ -71,7 +72,7 @@ def encode_string(string: str) -> bytes:
 def decode_array_of_str(b64decoded_string: bytes) -> list[str]:
     arr_length = b64decoded_string[0]
     lst = [''] * arr_length
-    start, end, i = 1, 1, 0
+    start, i = 1, 0
     for i in range(arr_length):
         s, len_s = decode_string(b64decoded_string[start:])
         lst[i] = s
@@ -108,7 +109,7 @@ class ComputerCRC8:
 
     def valid_crc8(self, bytes_input: bytes, crc8: int):
         if self.compute(bytes_input) != crc8:
-            raise CRC8Exception
+            raise CRC8Error
 
 
 def get_packets(b64decoded_string: bytes) -> Generator:
@@ -117,7 +118,7 @@ def get_packets(b64decoded_string: bytes) -> Generator:
         end += b64decoded_string[start] + 2
         try:
             packet = Packet.from_bytes(b64decoded_string[start:end])
-        except CRC8Exception:
+        except CRC8Error:
             continue
         finally:
             start = end
@@ -155,7 +156,6 @@ class Payload:
 
     @classmethod
     def from_bytes(cls, b64decoded_string: bytes):
-        # TODO Error handling (StopIterations etc)
         decoder = uleb128_decode(b64decoded_string)
         src, _ = next(decoder)
         dst, _ = next(decoder)
@@ -229,22 +229,31 @@ class Timer:
         return timestamp
 
 
-class AbsStatused(ABC):
+class Device(ABC):
+    dev_type = None
+
+    def __init__(self, address: int, name: str):
+        self.address = address
+        self.name = name
+
+    @classmethod
+    @abstractmethod
+    def from_bytes(cls, cmd_body: bytes, address: int):
+        pass
+
+
+class Status(Device):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.is_connected = True
+        self.reqstatus_times: Deque[int] = deque()
+
     def reqstatus_expired(self, time: int):
         if self.is_connected and self.reqstatus_times:
             first_reqstatus_time = self.reqstatus_times[0]
-            if time - first_reqstatus_time >= 300:
+            if time - first_reqstatus_time > 300:
                 self.is_connected = False
-        return self.is_connected
-
-    def _form_setstatus(self, smarthub, cmd_body: bytes) -> Packet:
-        return Packet(
-            Payload(
-                smarthub.src, self.address,
-                smarthub.serial, self.dev_type,
-                Command.SETSTATUS, cmd_body
-            )
-        )
+        return not self.is_connected
 
     def _form_getstatus(self, smarthub) -> Packet:
         return Packet(
@@ -259,22 +268,11 @@ class AbsStatused(ABC):
     def _send_getstatus_actions(self, smarthub):
         pass
 
-    @abstractmethod
-    def _send_setstatus_actions(self, smarthub, status):
-        pass
-
     def send_getstatus(self, smarthub):
         if self.reqstatus_expired(smarthub.timer.time):
             smarthub.remove_device(self)
         else:
             self._send_getstatus_actions(smarthub)
-            self.reqstatus_times.appendleft(smarthub.timer.time)
-
-    def send_setstatus(self, smarthub, status):
-        if self.reqstatus_expired(smarthub.timer.time):
-            smarthub.remove_device(self)
-        else:
-            self._send_setstatus_actions(smarthub, status)
             self.reqstatus_times.appendleft(smarthub.timer.time)
 
     @abstractmethod
@@ -283,32 +281,53 @@ class AbsStatused(ABC):
 
     def handle_status(self, smarthub, cmd_body):
         if self.reqstatus_expired(smarthub.timer.time):
-            smarthub.remove_device(smarthub)
+            smarthub.remove_device(self)
         else:
             self._handle_status_actions(smarthub, cmd_body)
-            self.reqstatus_times.pop()
+            if self.reqstatus_times:
+                self.reqstatus_times.pop()
 
 
-class Switch(AbsStatused):
-    def __init__(self, name: str, device_names: list[str], address: int):
-        self.dev_type = DeviceType.Switch
-        self.name = name
-        self.device_names = device_names
-        self.address = address
-        self.is_on = None
+class StatusSet(Status):
+    def _form_setstatus(self, smarthub, cmd_body: bytes) -> Packet:
+        return Packet(
+            Payload(
+                smarthub.src, self.address,
+                smarthub.serial, self.dev_type,
+                Command.SETSTATUS, cmd_body
+            )
+        )
 
-        self.is_connected = True
-        self.reqstatus_times: Deque[int] = deque()
-
-    def _send_getstatus_actions(self, smarthub):
-        smarthub.packets_to_send.appendleft(self._form_getstatus(smarthub))
-
+    @abstractmethod
     def _send_setstatus_actions(self, smarthub, status):
         pass
 
+    def send_setstatus(self, smarthub, status):
+        if self.reqstatus_expired(smarthub.timer.time):
+            smarthub.remove_device(self)
+        else:
+            self._send_setstatus_actions(smarthub, status)
+            self.reqstatus_times.appendleft(smarthub.timer.time)
+
+
+class StatusManaged(StatusSet):
+    @abstractmethod
+    def change_poweron_status_to(self, smarthub, is_on):
+        pass
+
+
+class Switch(Status):
+    dev_type = DeviceType.Switch
+
+    def __init__(self, device_names: list[str], *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.device_names = device_names
+
+    def _send_getstatus_actions(self, smarthub):
+        smarthub.send_packet(self._form_getstatus(smarthub))
+
     def _handle_status_actions(self, smarthub, cmd_body: bytes):
         self.is_on = bool(cmd_body[0])
-        print('switch is on:', self.is_on, 'devices:')
         for dev_name in self.device_names:
             device = smarthub.name2device.get(dev_name)
             if device is not None:
@@ -320,75 +339,128 @@ class Switch(AbsStatused):
         name, name_len = decode_string(cmd_body)
         devices = decode_array_of_str(cmd_body[name_len:])
         print(devices)
-        return cls(name, devices, address)
+        return cls(devices, address, name)
 
 
-class Lamp(AbsStatused):
-    def __init__(self, name: str, address: int):
-        self.dev_type = DeviceType.Lamp
-        self.name = name
-        self.address = address
-        self.is_on = None
-
-        self.is_connected = True
-        self.reqstatus_times: Deque[int] = deque()
+class Lamp(StatusManaged):
+    dev_type = DeviceType.Lamp
 
     def _send_setstatus_actions(self, smarthub, status: int):
-        smarthub.packets_to_send.appendleft(
+        smarthub.send_packet(
             self._form_setstatus(smarthub, status.to_bytes(1, 'big'))
         )
 
     def _send_getstatus_actions(self, smarthub):
-        smarthub.packets_to_send.appendleft(self._form_getstatus(smarthub))
+        smarthub.send_packet(self._form_getstatus(smarthub))
 
     def _handle_status_actions(self, smarthub, cmd_body: bytes):
-        print(f'LAMP SET: {bool(cmd_body[0])}')
         self.is_on = bool(cmd_body[0])
+
+    def change_poweron_status_to(self, smarthub, to_on: bool):
+        self.send_setstatus(smarthub, to_on)
 
     @classmethod
     def from_bytes(cls, cmd_body: bytes, address: int):
         name, _ = decode_string(cmd_body)
-        return cls(name, address)
+        return cls(address, name)
 
 
-class Socket(AbsStatused):
-    def __init__(self, name: str, address: int):
-        self.dev_type = DeviceType.Lamp
-        self.name = name
-        self.address = address
-        self.is_on = None
-
-        self.is_connected = True
-        self.reqstatus_times: Deque[int] = deque()
+class Socket(StatusManaged):
+    dev_type = DeviceType.Socket
 
     def _send_setstatus_actions(self, smarthub, status: int):
-        smarthub.packets_to_send.appendleft(
+        smarthub.smarthub.send_packet(
             self._form_setstatus(smarthub, status.to_bytes(1, 'big'))
         )
 
     def _send_getstatus_actions(self, smarthub):
-        smarthub.packets_to_send.appendleft(self._form_getstatus(smarthub))
+        smarthub.send_packet(self._form_getstatus(smarthub))
 
     def _handle_status_actions(self, smarthub, cmd_body: bytes):
-        print(f'LAMP SET: {bool(cmd_body[0])}')
         self.is_on = bool(cmd_body[0])
+
+    def change_poweron_status_to(self, smarthub, to_on: bool):
+        self.send_setstatus(smarthub, to_on)
 
     @classmethod
     def from_bytes(cls, cmd_body: bytes, address: int):
         name, _ = decode_string(cmd_body)
-        return cls(name, address)
+        return cls(address, name)
 
 
-class EnvSensor(AbsStatused):
-    def __init__(self, name: str, address: int,
-                 sensors: int, triggers: list):
-        self.name = name
-        self.address = address
+class Trigger:
+    def __init__(self, op: int, value: int, device_name: str):
+        self.op = op
+        self.value = value
+        self.device_name = device_name
+
+    def sensor_num(self) -> int:
+        return (self.op & 12) >> 2
+
+    def threshold_passed(self, value) -> bool:
+        if self.op & 2 == 1:
+            return value > self.value
+        else:
+            return value < self.value
+
+    def react(self, value: int, smarthub):
+        if self.threshold_passed(value):
+            device = smarthub.name2device.get(self.device_name)
+            if device is not None:
+                device.change_poweron_status_to(bool(self.op & 1))
+
+    @classmethod
+    def trig_and_len_from_bytes(cls, encoded_trigger):
+        op = encoded_trigger[0]
+        value, length = next(uleb128_decode(encoded_trigger[1:]))
+        name, str_len = decode_string(encoded_trigger[1 + length:])  # + 1 because of op
+        return cls(op, value, name), 1 + length + str_len
+
+
+class EnvSensor(Status):
+    dev_type = DeviceType.EnvSensor
+
+    def __init__(self, sensors: int,
+                 triggers: dict[int, list[Trigger]],
+                 *args, **kwargs):
+        super().__init__(*args, **kwargs)
         self.sensors = sensors
         self.triggers = triggers
 
-        self.is_connected = True
-        self.reqstatus_times: Deque[int] = deque()
+    def sensor_exist(self, sensor_num) -> bool:
+        # sensor_num = 0, 1, 2, 3
+        return self.sensors & 2**sensor_num == 1
+
+    def _send_getstatus_actions(self, smarthub):
+        smarthub.packets_to_send.appendleft(self._form_getstatus(smarthub))
+
+    def _handle_status_actions(self, smarthub, cmd_body):
+        sensor_num = 0
+        for value in uleb128_decode(cmd_body):
+            while not self.sensor_exist(sensor_num):
+                sensor_num += 1
+            for trigger in self.triggers.get(sensor_num, []):
+                trigger.react(value, smarthub)
+            sensor_num += 1
+
+    @classmethod
+    def from_bytes(cls, cmd_body: bytes, address: int):
+        name, length = decode_string(cmd_body)
+        sensors = cmd_body[length]
+        triggers = cls._decode_triggers(cmd_body[length+1:])
+        return cls(sensors, triggers, address, name)
+
+    @classmethod
+    def _decode_triggers(cls, triggers_array: bytes) -> dict[int, list[Trigger]]:
+        # return dict sensor_num: trigger
+        length = triggers_array[0]
+        triggers = {}
+        start, end, i = 1, 1, 0
+        for i in range(length):
+            trigger, tr_len = Trigger.trig_and_len_from_bytes(triggers_array[start:])
+            triggers.setdefault(trigger.sensor_num, []).append(trigger)
+            start += tr_len
+        return triggers
 
 
 class DeviceBuilder:
@@ -399,8 +471,10 @@ class DeviceBuilder:
         DeviceType.EnvSensor: EnvSensor
     }
 
-    def build_device_from_bytes(self, cmd_body: bytes,
-                                dev_type: DeviceType, address: int):
+    def build_device_from_bytes(self,
+                                cmd_body: bytes,
+                                dev_type: DeviceType,
+                                address: int):
         dev_class = self.devtype2device.get(dev_type)
         if dev_class is not None:
             return dev_class.from_bytes(cmd_body, address)
@@ -414,8 +488,9 @@ class SmartHub:
         self.url = url
         self.src = src
         self.dev_type = DeviceType.SmartHub
-        self.packets_to_send: Deque[Packet] = deque()
         self._serial = serial
+
+        self.responses: Deque[Response] = deque()
 
         self._device_builder = DeviceBuilder()
         self._devices = {dev_type: {} for dev_type in DeviceType}
@@ -423,6 +498,10 @@ class SmartHub:
 
         self.timer = Timer()
         self._whoishere_time = None
+
+    @property
+    def serial(self):
+        return self._serial
 
     def _form_whoishere(self) -> Packet:
         return Packet(Payload(self.src, 0x3FFF,
@@ -435,11 +514,11 @@ class SmartHub:
                               Command.IAMHERE, self.encoded_name))
 
     def _add_device(self, device):
-        self._devices[device.dev_type][device.address] = device
+        self._devices.setdefault(device.dev_type, {})[device.address] = device
         self.name2device[device.name] = device
 
     def remove_device(self, device):
-        self._devices[device.dev_type].pop(device.address, None)
+        self._devices.get(device.dev_type, {}).pop(device.address, None)
         self.name2device.pop(device.name, None)
 
     def _handle_iamhere(self, packet: Packet):
@@ -453,7 +532,7 @@ class SmartHub:
             device.send_getstatus(self)
 
     def _handle_whoishere(self, packet: Packet):
-        self.packets_to_send.appendleft(self._form_iamhere())
+        self.send_packet(self._form_iamhere())
         self._handle_iamhere(packet)
 
     def _handle_status(self, packet: Packet):
@@ -462,28 +541,27 @@ class SmartHub:
         if device is not None:
             device.handle_status(self, packet.payload.cmd_body)
 
+    def _send_encoded(self, packet: bytes):
+        try:
+            res = send_request(self.url, packet)
+        except RequestException:
+            sys.exit(99)
+        self.responses.appendleft(res)
+
+    def send_packet(self, packet: Packet):
+        self._send_encoded(b64_encode(packet.encode()))
+        self._serial += 1
+
     def start(self):
-        self.packets_to_send.appendleft(self._form_whoishere())
+        self.send_packet(self._form_whoishere())
 
         while True:
-            # Handle http error
-            if self.packets_to_send:
-                p = self.packets_to_send.pop()
-                print('send packet:', p)
-                p = p.encode()
-            else:
-                p = b''
-
-            try:
-                res = send_request(self.url, b64_encode(p))
-                self._serial += 1
-            except RequestException:
-                sys.exit(99)
+            if not self.responses:
+                self._send_encoded(b'')
+            res = self.responses.pop()
 
             if res.status_code == 200:
-                print(f'{res.content=}')
                 b64decoded_string = b64_decode(res.content)
-                print(f'{b64decoded_string=}')
 
                 packets = []
                 current_time = None
@@ -501,21 +579,16 @@ class SmartHub:
                         case Command.IAMHERE:
                             if self._whoishere_time is None:
                                 self._whoishere_time = self.timer.time
-                            if self.timer.time - self._whoishere_time < 300:
+                            if self.timer.time - self._whoishere_time <= 300:
                                 self._handle_iamhere(packet)
                         case Command.WHOISHERE:
                             self._handle_whoishere(packet)
                         case Command.STATUS:
-                            print('HANDLE STATUS')
                             self._handle_status(packet)
             elif res.status_code == 204:
                 sys.exit(0)
             else:
                 sys.exit(99)
-            print(self._devices)
-            print(self.name2device)
-            print()
-            print()
 
 
 def main(url: str, myaddr: int):

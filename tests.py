@@ -1,6 +1,10 @@
 import unittest
 import base64
-from hub import Packet, Payload, ComputerCRC8
+from hub import (
+    Packet, Payload, ComputerCRC8,
+    uleb128_encode, Command, DeviceType,
+    EnvSensor, b64_encode, b64_decode
+)
 
 
 class TestCRC8Computer(unittest.TestCase):
@@ -29,23 +33,43 @@ class TestCRC8Computer(unittest.TestCase):
         self.assertEqual(self.computer.crctable, table)
 
     def test_compute(self):
-        input_bytes = Payload(819, 16383, 1, 6, 6, 1688984021000).encode()
+        times = 1688984021000
+        input_bytes = Payload(819, 16383, 1, DeviceType(6), Command(6), uleb128_encode(1688984021000)).encode()
         answer = 138
         self.assertEqual(answer, self.computer.compute(input_bytes))
 
 
 class TestPacketDecode(unittest.TestCase):
     def test_timestamp(self):
-        encoded_packet = 'DbMG_38BBgaI0Kv6kzGK'
-        decoded_true = Packet(13, Payload(819, 16383, 1, 6, 6, 1688984021000), 138)
-        self.assertEqual(Packet.from_bytes(base64.urlsafe_b64decode(encoded_packet)),
+        encoded_packet = b'DbMG_38BBgaI0Kv6kzGK'
+        decoded_true = Packet(Payload(819, 16383, 1, DeviceType(6), Command(6), uleb128_encode(1688984021000)), 13, 138)
+        self.assertEqual(Packet.from_bytes(b64_decode(encoded_packet)),
                          decoded_true)
 
 
 class TestPacketEncode(unittest.TestCase):
     def test_timestamp(self):
-        packet = Packet(13, Payload(819, 16383, 1, 6, 6, 1688984021000), 138)
+        packet = Packet(Payload(819, 16383, 1, DeviceType(6), Command(6), uleb128_encode(1688984021000)), 13, 138)
         encoded_packet = b'DbMG_38BBgaI0Kv6kzGK'
-        self.assertEqual(base64.urlsafe_b64encode(packet.encode()).rstrip(b'='),
+        self.assertEqual(b64_encode(packet.encode()).rstrip(b'='),
                          encoded_packet)
+
+
+class TestPackages(unittest.TestCase):
+    def test_envsensor(self):
+        encoded_packet = b'OAL_fwMCAQhTRU5TT1IwMQ8EDGQGT1RIRVIxD7AJBk9USEVSMgCsjQYGT1RIRVIzCAAGT1RIRVI03Q'
+        packet = Packet.from_bytes(b64_decode(encoded_packet))
+        with self.subTest():
+            self.assertEqual(packet.length, 56)
+            self.assertEqual(packet.payload.src, 2)
+            self.assertEqual(packet.payload.dst, 16383)
+            self.assertEqual(packet.payload.serial, 3)
+            self.assertEqual(packet.payload.dev_type, DeviceType.EnvSensor)
+            self.assertEqual(packet.payload.cmd, Command.WHOISHERE)
+        env_sensor = EnvSensor.from_bytes(packet.payload.cmd_body, packet.payload.src)
+        with self.subTest():
+            self.assertEqual(env_sensor.address, packet.payload.src)
+            self.assertEqual(env_sensor.name, 'SENSOR01')
+            self.assertEqual(env_sensor.sensors, 15)
+        print(env_sensor.address, env_sensor.name)
 
