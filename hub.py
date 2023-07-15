@@ -439,7 +439,7 @@ class Trigger:
         return (self.op & 12) >> 2
 
     def threshold_passed(self, value) -> bool:
-        if self.op & 2 == 1:
+        if (self.op & 2) >> 1 == 1:
             return value > self.value
         else:
             return value < self.value
