@@ -10,9 +10,13 @@ from abc import ABC, abstractmethod
 
 import requests
 from requests import RequestException, Response
-
+    
 
 class CRC8Error(Exception):
+    pass
+
+
+class DecodePacketError(Exception):
     pass
 
 
@@ -61,7 +65,10 @@ def decode_string(b64decoded_string: bytes) -> tuple[str, int]:
     str_len = b64decoded_string[0]
     string = [''] * str_len
     for i, code in enumerate(b64decoded_string[1:str_len+1]):
-        string[i] = chr(code)
+        try:
+            string[i] = chr(code)
+        except IndexError:
+            raise DecodePacketError
     return ''.join(string), str_len + 1
 
 
@@ -70,13 +77,37 @@ def encode_string(string: str) -> bytes:
 
 
 def decode_array_of_str(b64decoded_string: bytes) -> list[str]:
-    arr_length = b64decoded_string[0]
+    try:
+        arr_length = b64decoded_string[0]
+    except IndexError:
+        raise DecodePacketError
     lst = [''] * arr_length
     start, i = 1, 0
     for i in range(arr_length):
-        s, len_s = decode_string(b64decoded_string[start:])
-        lst[i] = s
-        start += len_s
+        try:
+            s, len_s = decode_string(b64decoded_string[start:])
+            lst[i] = s
+            start += len_s
+        except IndexError:
+            raise DecodePacketError
+    return lst
+
+
+def decode_array_of_values(b64decoded_string: bytes) -> list[int]:
+    try:
+        arr_length = b64decoded_string[0]
+    except IndexError:
+        raise DecodePacketError
+    lst = [0] * arr_length
+    i = 0
+    for value, value_len in uleb128_decode(b64decoded_string[1:]):
+        try:
+            lst[i] = value
+            i += 1
+        except IndexError:
+            raise DecodePacketError
+    if len(lst) != arr_length:
+        raise DecodePacketError
     return lst
 
 
@@ -115,11 +146,13 @@ class ComputerCRC8:
 def get_packets(b64decoded_string: bytes) -> Generator:
     start, end, cnt = 0, 0, 0
     while start < len(b64decoded_string) and cnt < len(b64decoded_string):
-        end += b64decoded_string[start] + 2
         try:
+            end += b64decoded_string[start] + 2
             packet = Packet.from_bytes(b64decoded_string[start:end])
         except CRC8Error:
             continue
+        except IndexError:
+            raise DecodePacketError
         finally:
             start = end
             cnt += 1
@@ -157,11 +190,17 @@ class Payload:
     @classmethod
     def from_bytes(cls, b64decoded_string: bytes):
         decoder = uleb128_decode(b64decoded_string)
-        src, _ = next(decoder)
-        dst, _ = next(decoder)
-        serial, length = next(decoder)
-        dev_type = b64decoded_string[length]
-        cmd = b64decoded_string[length + 1]
+        try:
+            src, _ = next(decoder)
+            dst, _ = next(decoder)
+            serial, length = next(decoder)
+        except StopIteration:
+            raise DecodePacketError
+        try:
+            dev_type = b64decoded_string[length]
+            cmd = b64decoded_string[length + 1]
+        except IndexError:
+            raise DecodePacketError
         return cls(src, dst, serial, DeviceType(dev_type),
                    Command(cmd), b64decoded_string[length + 2:])
 
@@ -197,9 +236,12 @@ class Packet:
 
     @classmethod
     def from_bytes(cls, b64decoded_string: bytes):
-        length = b64decoded_string[0]
-        crc8 = b64decoded_string[-1]
-        payload = Payload.from_bytes(b64decoded_string[1:-1])
+        try:
+            length = b64decoded_string[0]
+            crc8 = b64decoded_string[-1]
+            payload = Payload.from_bytes(b64decoded_string[1:-1])
+        except IndexError:
+            raise DecodePacketError
         cls.crc8_computer.valid_crc8(b64decoded_string[1:-1], crc8)
         return cls(payload, length, crc8)
 
@@ -331,14 +373,12 @@ class Switch(Status):
         for dev_name in self.device_names:
             device = smarthub.name2device.get(dev_name)
             if device is not None:
-                print(f'\t{device.name}')
                 device.send_setstatus(smarthub, self.is_on)
 
     @classmethod
     def from_bytes(cls, cmd_body: bytes, address: int):
         name, name_len = decode_string(cmd_body)
         devices = decode_array_of_str(cmd_body[name_len:])
-        print(devices)
         return cls(devices, address, name)
 
 
@@ -394,6 +434,7 @@ class Trigger:
         self.value = value
         self.device_name = device_name
 
+    @property
     def sensor_num(self) -> int:
         return (self.op & 12) >> 2
 
@@ -411,10 +452,21 @@ class Trigger:
 
     @classmethod
     def trig_and_len_from_bytes(cls, encoded_trigger):
-        op = encoded_trigger[0]
-        value, length = next(uleb128_decode(encoded_trigger[1:]))
-        name, str_len = decode_string(encoded_trigger[1 + length:])  # + 1 because of op
+        try:
+            op = encoded_trigger[0]
+            value, length = next(uleb128_decode(encoded_trigger[1:]))
+            name, str_len = decode_string(encoded_trigger[1 + length:])  # + 1 because of op
+        except (IndexError, StopIteration):
+            raise DecodePacketError
         return cls(op, value, name), 1 + length + str_len
+
+    def __repr__(self):
+        return f'{self.__class__.__name__}({self.op}, {self.value}, {self.device_name})'
+
+    def __eq__(self, other):
+        return all((self.op == other.op,
+                    self.value == other.value,
+                    self.device_name == other.device_name))
 
 
 class EnvSensor(Status):
@@ -429,15 +481,17 @@ class EnvSensor(Status):
 
     def sensor_exist(self, sensor_num) -> bool:
         # sensor_num = 0, 1, 2, 3
-        return self.sensors & 2**sensor_num == 1
+        return (self.sensors & 2**sensor_num) >> sensor_num == 1
 
     def _send_getstatus_actions(self, smarthub):
         smarthub.packets_to_send.appendleft(self._form_getstatus(smarthub))
 
     def _handle_status_actions(self, smarthub, cmd_body):
         sensor_num = 0
-        for value in uleb128_decode(cmd_body):
+        for value in decode_array_of_values(cmd_body):
             while not self.sensor_exist(sensor_num):
+                if sensor_num > 3:
+                    raise DecodePacketError
                 sensor_num += 1
             for trigger in self.triggers.get(sensor_num, []):
                 trigger.react(value, smarthub)
@@ -446,8 +500,11 @@ class EnvSensor(Status):
     @classmethod
     def from_bytes(cls, cmd_body: bytes, address: int):
         name, length = decode_string(cmd_body)
-        sensors = cmd_body[length]
-        triggers = cls._decode_triggers(cmd_body[length+1:])
+        try:
+            sensors = cmd_body[length]
+            triggers = cls._decode_triggers(cmd_body[length+1:])
+        except IndexError:
+            raise DecodePacketError
         return cls(sensors, triggers, address, name)
 
     @classmethod
@@ -565,26 +622,28 @@ class SmartHub:
 
                 packets = []
                 current_time = None
-                for packet in get_packets(b64decoded_string):
-                    print(f'{packet=}')
-                    if packet.payload.cmd == Command.TICK:
-                        current_time = self.timer.decode_tick(packet.payload.cmd_body)
-                    else:
-                        packets.append(packet)
-                if current_time is not None:
-                    self.timer.time = current_time
+                try:
+                    for packet in get_packets(b64decoded_string):
+                        if packet.payload.cmd == Command.TICK:
+                            current_time = self.timer.decode_tick(packet.payload.cmd_body)
+                        else:
+                            packets.append(packet)
+                    if current_time is not None:
+                        self.timer.time = current_time
 
-                for packet in packets:
-                    match packet.payload.cmd:
-                        case Command.IAMHERE:
-                            if self._whoishere_time is None:
-                                self._whoishere_time = self.timer.time
-                            if self.timer.time - self._whoishere_time <= 300:
-                                self._handle_iamhere(packet)
-                        case Command.WHOISHERE:
-                            self._handle_whoishere(packet)
-                        case Command.STATUS:
-                            self._handle_status(packet)
+                    for packet in packets:
+                        match packet.payload.cmd:
+                            case Command.IAMHERE:
+                                if self._whoishere_time is None:
+                                    self._whoishere_time = self.timer.time
+                                if self.timer.time - self._whoishere_time <= 300:
+                                    self._handle_iamhere(packet)
+                            case Command.WHOISHERE:
+                                self._handle_whoishere(packet)
+                            case Command.STATUS:
+                                self._handle_status(packet)
+                except DecodePacketError:
+                    continue
             elif res.status_code == 204:
                 sys.exit(0)
             else:
