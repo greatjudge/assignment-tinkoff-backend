@@ -1,10 +1,10 @@
 import unittest
-import base64
 from hub import (
     Packet, Payload, ComputerCRC8,
     uleb128_encode, Command, DeviceType,
-    EnvSensor, b64_encode, b64_decode
+    EnvSensor, b64_encode, b64_decode, Trigger
 )
+from unittest import mock
 
 
 class TestCRC8Computer(unittest.TestCase):
@@ -55,8 +55,8 @@ class TestPacketEncode(unittest.TestCase):
                          encoded_packet)
 
 
-class TestPackages(unittest.TestCase):
-    def test_envsensor(self):
+class TestEnvSensor(unittest.TestCase):
+    def test_whoishere(self):
         encoded_packet = b'OAL_fwMCAQhTRU5TT1IwMQ8EDGQGT1RIRVIxD7AJBk9USEVSMgCsjQYGT1RIRVIzCAAGT1RIRVI03Q'
         packet = Packet.from_bytes(b64_decode(encoded_packet))
         with self.subTest():
@@ -71,5 +71,33 @@ class TestPackages(unittest.TestCase):
             self.assertEqual(env_sensor.address, packet.payload.src)
             self.assertEqual(env_sensor.name, 'SENSOR01')
             self.assertEqual(env_sensor.sensors, 15)
-        print(env_sensor.address, env_sensor.name)
+            self.assertEqual(env_sensor.triggers, {3: [Trigger(12, 100, "OTHER1"), Trigger(15, 1200, "OTHER2")],
+                                                   0: [Trigger(0, 100012, "OTHER3")],
+                                                   2: [Trigger(8, 0, "OTHER4")]})
 
+    def test_status(self):
+        encoded_packet = b'EQIBBgIEBKUB4AfUjgaMjfILrw'
+        packet = Packet.from_bytes(b64_decode(encoded_packet))
+        with self.subTest():
+            self.assertEqual(packet.length, 17)
+            self.assertEqual(packet.payload.src, 2)
+            self.assertEqual(packet.payload.dst, 1)
+            self.assertEqual(packet.payload.serial, 6)
+            self.assertEqual(packet.payload.dev_type, DeviceType.EnvSensor)
+            self.assertEqual(packet.payload.cmd, Command.STATUS)
+        smarthub = mock.MagicMock()
+        values = [165, 992, 100180, 24938124]
+        triggers = {
+            0: [mock.Mock()],
+            1: [mock.Mock()],
+            2: [mock.Mock()],
+            3: [mock.Mock()]
+        }
+        for num, (trigger,) in triggers.items():
+            trigger.react = mock.Mock()
+
+        envsensor = EnvSensor(15, triggers, packet.payload.dst, 'name')
+        envsensor._handle_status_actions(smarthub, packet.payload.cmd_body)
+        for sensor_num, (trigger,) in triggers.items():
+            self.assertEqual(trigger.react.mock_calls,
+                             [mock.call(values[sensor_num], smarthub)])
